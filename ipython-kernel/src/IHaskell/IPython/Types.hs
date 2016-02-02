@@ -117,7 +117,7 @@ instance ToJSON Transport where
 -------------------- IPython Kernelspec Types ----------------------
 data KernelSpec =
        KernelSpec
-         { 
+         {
          -- | Name shown to users to describe this kernel (e.g. "Haskell")
          kernelDisplayName :: String
          -- | Name for the kernel; unique kernel identifier (e.g. "haskell")
@@ -329,10 +329,10 @@ data Message =
              -- | An error reply to an execute request
                ExecuteError
                  { header :: MessageHeader
-                 , pagerOutput :: [DisplayData]          -- ^ The mimebundles to display in the pager.
                  , traceback :: [Text]
                  , ename :: Text
                  , evalue :: Text
+                 , executionCounter :: Int
                  }
              |
                PublishStatus
