@@ -1,4 +1,5 @@
-{-# LANGUAGE OverloadedStrings, DoAndIfThenElse #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DoAndIfThenElse #-}
 
 -- | Description : Low-level ZeroMQ communication wrapper.
 --
@@ -12,6 +13,7 @@ module IHaskell.IPython.ZeroMQ (
     serveStdin,
     ZeroMQEphemeralPorts,
     withEphemeralPorts,
+    withEphemeralProfile,
     ) where
 
 import           Control.Concurrent
@@ -32,12 +34,20 @@ import           IHaskell.IPython.Message.Parser
 import           IHaskell.IPython.Message.Writer ()
 import           IHaskell.IPython.Types
 
+-- | Read the request from ZeroMQ socket and send it along channel.
+readRequestSocket :: Receiver a => Bool -> Socket a -> Chan Message -> IO ()
+readRequestSocket debug socket chan = receiveMessage debug socket >>= writeChan chan
+
+-- | Read the reply from the channel and send it along ZeroMQ socket
+writeReplySocket :: Sender a => Bool -> ByteString -> Chan Message -> Socket a -> IO ()
+writeReplySocket debug key chan socket = readChan chan >>= sendMessage debug key socket
+
 -- | The channel interface to the ZeroMQ sockets. All communication is done via Messages, which are
 -- encoded and decoded into a lower level form before being transmitted to IPython. These channels
 -- should functionally serve as high-level sockets which speak Messages instead of ByteStrings.
 data ZeroMQInterface =
        Channels
-         { 
+         {
          -- | A channel populated with requests from the frontend.
          shellRequestChannel :: Chan Message
          -- | Writing to this channel causes a reply to be sent to the frontend.
@@ -59,6 +69,12 @@ data ZeroMQStdin =
          { stdinRequestChannel :: Chan Message
          , stdinReplyChannel :: Chan Message
          }
+
+newZeroMQStdin :: IO ZeroMQStdin
+newZeroMQStdin =  do
+  reqChannel <- newChan
+  repChannel <- newChan
+  return $ StdinChannel reqChannel repChannel
 
 -- | Create new channels for a ZeroMQInterface
 newZeroMQInterface :: ByteString -> IO ZeroMQInterface
@@ -171,6 +187,54 @@ withEphemeralPorts key debug callback = do
             -- Run callback function; provide it with both ports and channels.
             callback ports channels
 
+-- | Run session for communicating with an IPython instance on ephemerally allocated
+-- ZMQ4 sockets including a stdin socket
+--
+-- The sockets will be closed when the callback returns.
+withEphemeralProfile :: ByteString -- ^ HMAC encryption key
+                    -> Bool -- ^ Print debug output
+                    -> (Profile
+                        -> ZeroMQInterface
+                        -> ZeroMQStdin
+                        -> IO a) -- ^ Callback that takes the interface to the sockets.
+                   -> IO a
+withEphemeralProfile key debug callback = do
+  channels <- newZeroMQInterface key
+  zeroMQStdin <- newZeroMQStdin
+  -- Create the ZMQ4 context
+  withContext $ \context -> do
+    -- Create the sockets to communicate with.
+    withSocket context Router $ \stdinSocket -> do
+      withSocket context Rep $ \heartbeatSocket -> do
+        withSocket context Router $ \controlportSocket -> do
+          withSocket context Router $ \shellportSocket -> do
+            withSocket context Pub $ \iopubSocket -> do
+              -- Bind each socket to a local port, getting the port chosen.
+              stdinPort'   <- bindLocalEphemeralPort stdinSocket
+              hbPort'      <- bindLocalEphemeralPort heartbeatSocket
+              controlPort' <- bindLocalEphemeralPort controlportSocket
+              shellPort'   <- bindLocalEphemeralPort shellportSocket
+              iopubPort'   <- bindLocalEphemeralPort iopubSocket
+              -- Create object to store ephemeral ports
+              let prof = Profile { ip = "127.0.0.1"
+                                 , transport = TCP
+                                 , stdinPort = stdinPort'
+                                 , controlPort = controlPort'
+                                 , hbPort = hbPort'
+                                 , shellPort = shellPort'
+                                 , iopubPort = iopubPort'
+                                 , signatureKey = key
+                                 }
+              -- Launch actions to listen to communicate between channels and sockets.
+              _ <- forkIO $ forever $ readRequestSocket debug stdinSocket (stdinRequestChannel zeroMQStdin)
+              _ <- forkIO $ forever $ writeReplySocket  debug (hmacKey channels) (stdinReplyChannel zeroMQStdin) stdinSocket
+              _ <- forkIO $ forever $ heartbeat channels heartbeatSocket
+              _ <- forkIO $ forever $ control debug channels controlportSocket
+              _ <- forkIO $ forever $ shell debug channels shellportSocket
+              _ <- forkIO $ checkedIOpub debug channels iopubSocket
+              -- Run callback function; provide it with both ports and channels.
+              callback prof channels zeroMQStdin
+
 serveStdin :: Profile -> IO ZeroMQStdin
 serveStdin profile = do
   reqChannel <- newChan
@@ -202,7 +266,6 @@ heartbeat :: ZeroMQInterface -> Socket Rep -> IO ()
 heartbeat _ socket = do
   -- Read some data.
   request <- receive socket
-
   -- Send it back.
   send socket [] request
 
@@ -212,10 +275,10 @@ heartbeat _ socket = do
 shell :: Bool -> ZeroMQInterface -> Socket Router -> IO ()
 shell debug channels socket = do
   -- Receive a message and write it to the interface channel.
-  receiveMessage debug socket >>= writeChan requestChannel
+  readRequestSocket debug socket requestChannel
 
   -- Read the reply from the interface channel and send it.
-  readChan replyChannel >>= sendMessage debug (hmacKey channels) socket
+  writeReplySocket debug (hmacKey channels) replyChannel socket
 
   where
     requestChannel = shellRequestChannel channels
@@ -227,10 +290,10 @@ shell debug channels socket = do
 control :: Bool -> ZeroMQInterface -> Socket Router -> IO ()
 control debug channels socket = do
   -- Receive a message and write it to the interface channel.
-  receiveMessage debug socket >>= writeChan requestChannel
+  readRequestSocket debug socket requestChannel
 
   -- Read the reply from the interface channel and send it.
-  readChan replyChannel >>= sendMessage debug (hmacKey channels) socket
+  writeReplySocket debug (hmacKey channels) replyChannel socket
 
   where
     requestChannel = controlRequestChannel channels
@@ -240,7 +303,7 @@ control debug channels socket = do
 -- channel | and then writes the messages to the socket.
 iopub :: Bool -> ZeroMQInterface -> Socket Pub -> IO ()
 iopub debug channels socket =
-  readChan (iopubChannel channels) >>= sendMessage debug (hmacKey channels) socket
+  writeReplySocket debug (hmacKey channels) (iopubChannel channels) socket
 
 -- | Attempt to send a message along the socket, returning true if successful.
 trySendMessage :: Sender a => String -> Bool -> ByteString -> Socket a -> Message -> IO Bool
