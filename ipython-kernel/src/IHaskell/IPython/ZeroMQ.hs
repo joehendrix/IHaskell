@@ -1,6 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DoAndIfThenElse #-}
-
 -- | Description : Low-level ZeroMQ communication wrapper.
 --
 -- The "ZeroMQ" module abstracts away the low-level 0MQ based interface with IPython, replacing it
@@ -11,9 +10,11 @@ module IHaskell.IPython.ZeroMQ (
     ZeroMQStdin(..),
     serveProfile,
     serveStdin,
-    ZeroMQEphemeralPorts,
+    ZeroMQEphemeralPorts(..),
     withEphemeralPorts,
     withEphemeralProfile,
+    receiveMessage,
+    sendMessage,
     ) where
 
 import           Control.Concurrent
@@ -42,9 +43,11 @@ readRequestSocket debug socket chan = receiveMessage debug socket >>= writeChan 
 writeReplySocket :: Sender a => Bool -> ByteString -> Chan Message -> Socket a -> IO ()
 writeReplySocket debug key chan socket = readChan chan >>= sendMessage debug key socket
 
--- | The channel interface to the ZeroMQ sockets. All communication is done via Messages, which are
--- encoded and decoded into a lower level form before being transmitted to IPython. These channels
--- should functionally serve as high-level sockets which speak Messages instead of ByteStrings.
+-- | The channel interface to the ZeroMQ sockets.
+-- All communication is done via Messages, which are encoded and decoded into a
+-- lower level form before being transmitted to IPython. These channels should
+-- functionally serve as high-level sockets which speak Messages instead of
+-- ByteStrings.
 data ZeroMQInterface =
        Channels
          {
@@ -106,7 +109,7 @@ serveProfile profile debug = do
   -- complete, the context or socket become invalid.
   forkIO $ withContext $ \context -> do
     -- Serve on all sockets.
-    forkIO $ serveSocket context Rep (hbPort profile) $ heartbeat channels
+    forkIO $ serveSocket context Rep (hbPort profile) heartbeat
     forkIO $ serveSocket context Router (controlPort profile) $ control debug channels
     forkIO $ serveSocket context Router (shellPort profile) $ shell debug channels
 
@@ -155,7 +158,9 @@ bindLocalEphemeralPort socket = do
     Just endpointIndex ->
       return endpointIndex
 
--- | Run session for communicating with an IPython instance on ephemerally allocated ZMQ4 sockets.
+-- | Run session for communicating with an IPython instance on ephemerally allocated ZMQ4
+-- sockets.
+--
 -- The sockets will be closed when the callback returns.
 withEphemeralPorts :: ByteString -- ^ HMAC encryption key
                    -> Bool -- ^ Print debug output
@@ -164,7 +169,6 @@ withEphemeralPorts :: ByteString -- ^ HMAC encryption key
                     -> IO a) -- ^ Callback that takes the interface to the sockets.
                    -> IO a
 withEphemeralPorts key debug callback = do
-  channels <- newZeroMQInterface key
   -- Create the ZMQ4 context
   withContext $ \context -> do
     -- Create the sockets to communicate with.
@@ -173,14 +177,20 @@ withEphemeralPorts key debug callback = do
         withSocket context Router $ \shellportSocket -> do
           withSocket context Pub $ \iopubSocket -> do
             -- Bind each socket to a local port, getting the port chosen.
-            hbPort <- bindLocalEphemeralPort heartbeatSocket
+            hbPort      <- bindLocalEphemeralPort heartbeatSocket
             controlPort <- bindLocalEphemeralPort controlportSocket
-            shellPort <- bindLocalEphemeralPort shellportSocket
-            iopubPort <- bindLocalEphemeralPort iopubSocket
+            shellPort   <- bindLocalEphemeralPort shellportSocket
+            iopubPort   <- bindLocalEphemeralPort iopubSocket
             -- Create object to store ephemeral ports
-            let ports = ZeroMQEphemeralPorts { ephHbPort = hbPort, ephControlPort = controlPort, ephShellPort = shellPort, ephIOPubPort = iopubPort, ephSignatureKey = key }
+            let ports = ZeroMQEphemeralPorts { ephHbPort = hbPort
+                                             , ephControlPort = controlPort
+                                             , ephShellPort = shellPort
+                                             , ephIOPubPort = iopubPort
+                                             , ephSignatureKey = key
+                                             }
             -- Launch actions to listen to communicate between channels and cockets.
-            _ <- forkIO $ forever $ heartbeat channels heartbeatSocket
+            channels <- newZeroMQInterface key
+            _ <- forkIO $ forever $ heartbeat heartbeatSocket
             _ <- forkIO $ forever $ control debug channels controlportSocket
             _ <- forkIO $ forever $ shell debug channels shellportSocket
             _ <- forkIO $ checkedIOpub debug channels iopubSocket
@@ -226,9 +236,11 @@ withEphemeralProfile key debug callback = do
                                  , signatureKey = key
                                  }
               -- Launch actions to listen to communicate between channels and sockets.
-              _ <- forkIO $ forever $ readRequestSocket debug stdinSocket (stdinRequestChannel zeroMQStdin)
-              _ <- forkIO $ forever $ writeReplySocket  debug (hmacKey channels) (stdinReplyChannel zeroMQStdin) stdinSocket
-              _ <- forkIO $ forever $ heartbeat channels heartbeatSocket
+              _ <- forkIO $ forever $ do
+                   readRequestSocket debug stdinSocket (stdinRequestChannel zeroMQStdin)
+              _ <- forkIO $ forever $
+                  writeReplySocket debug (hmacKey channels) (stdinReplyChannel zeroMQStdin) stdinSocket
+              _ <- forkIO $ forever $ heartbeat heartbeatSocket
               _ <- forkIO $ forever $ control debug channels controlportSocket
               _ <- forkIO $ forever $ shell debug channels shellportSocket
               _ <- forkIO $ checkedIOpub debug channels iopubSocket
@@ -262,16 +274,19 @@ serveSocket context socketType port action = void $
     forever $ action socket
 
 -- | Listener on the heartbeat port. Echoes back any data it was sent.
-heartbeat :: ZeroMQInterface -> Socket Rep -> IO ()
-heartbeat _ socket = do
+heartbeat :: Socket Rep -> IO ()
+heartbeat socket = do
   -- Read some data.
   request <- receive socket
   -- Send it back.
   send socket [] request
 
--- | Listener on the shell port. Reads messages and writes them to | the shell request channel. For
--- each message, reads a response from the | shell reply channel of the interface and sends it back
--- to the frontend.
+-- | Listener on the shell port.
+--
+-- Reads messages and writes them to | the shell request channel.
+--
+-- For each message, reads a response from the | shell reply channel of the
+-- interface and sends it back to the frontend.
 shell :: Bool -> ZeroMQInterface -> Socket Router -> IO ()
 shell debug channels socket = do
   -- Receive a message and write it to the interface channel.
@@ -306,12 +321,12 @@ iopub debug channels socket =
   writeReplySocket debug (hmacKey channels) (iopubChannel channels) socket
 
 -- | Attempt to send a message along the socket, returning true if successful.
-trySendMessage :: Sender a => String -> Bool -> ByteString -> Socket a -> Message -> IO Bool
-trySendMessage nm debug hmacKey socket message = do
+trySendMessage :: Sender a => Bool -> ByteString -> Socket a -> Message -> IO Bool
+trySendMessage debug hmacKey socket message = do
   let zmqErrorHandler :: ZMQError -> IO Bool
       zmqErrorHandler e
-        -- Ignore errors if we cannot send. We may want to forward this to the thread that tried put the
-        -- message in the Chan initially.
+        -- Ignore errors if we cannot send. We may want to forward this to the thread
+        -- that tried put the message in the Chan initially.
         | errno e == 38 = return False
         | otherwise = throwIO e
   (sendMessage debug hmacKey socket message >> return True) `catch` zmqErrorHandler
@@ -322,7 +337,7 @@ trySendMessage nm debug hmacKey socket message = do
 checkedIOpub :: Bool -> ZeroMQInterface -> Socket Pub -> IO ()
 checkedIOpub debug channels socket = do
   msg <- readChan (iopubChannel channels)
-  cont <- trySendMessage "io" debug (hmacKey channels) socket msg
+  cont <- trySendMessage debug (hmacKey channels) socket msg
   when cont $
     checkedIOpub debug channels socket
 
@@ -363,8 +378,12 @@ receiveMessage debug socket = do
           return $ line : remaining
         else return []
 
--- | Encode a message in the IPython ZeroMQ communication protocol and send it through the provided
--- socket. Sign it using HMAC with SHA-256 using the provided key.
+-- | Encode a message in the IPython ZeroMQ communication protocol and send it through the
+-- provided socket.
+--
+-- Sign it using HMAC with SHA-256 using the provided key.
+--
+-- This may throw an 'ZMQError' if the socket is closed.
 sendMessage :: Sender a => Bool -> ByteString -> Socket a -> Message -> IO ()
 sendMessage _ _ _ SendNothing = return ()
 sendMessage debug hmacKey socket message = do
